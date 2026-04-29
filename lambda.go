@@ -1,82 +1,143 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"flag"
 	"fmt"
-	"strconv"
+	"os"
 )
 
-// Lambda command implementations
+func lambdaPrintUsage() {
+	fmt.Print(`Usage: mocklib-cli lambda <action> [flags]
 
-func lambdaCreate(functionName, runtime string, memoryMB ...string) error {
-	memory := 256
-	if len(memoryMB) > 0 {
-		var err error
-		memory, err = strconv.Atoi(memoryMB[0])
+Actions:
+  create    Create a Lambda function
+  list      List all Lambda functions
+  get       Get a Lambda function
+  invoke    Invoke a Lambda function
+  delete    Delete a Lambda function
+
+Flags:
+  create:
+    --name      Function name (required)
+    --runtime   Runtime, e.g. python3.11, nodejs18.x (required)
+    --handler   Handler, e.g. index.handler (required)
+    --zip       Path to deployment ZIP file (required)
+
+  get / delete:
+    --name      Function name (required)
+
+  invoke:
+    --name      Function name (required)
+    --payload   JSON payload string (default: {})
+`)
+}
+
+func runLambda(args []string) {
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
+		lambdaPrintUsage()
+		os.Exit(0)
+	}
+
+	action := args[0]
+	rest := args[1:]
+
+	switch action {
+	case "create":
+		fs := flag.NewFlagSet("create", flag.ExitOnError)
+		name := fs.String("name", "", "Function name")
+		runtime := fs.String("runtime", "", "Runtime (e.g. python3.11, nodejs18.x)")
+		handler := fs.String("handler", "", "Handler (e.g. index.handler)")
+		zipPath := fs.String("zip", "", "Path to deployment ZIP file")
+		fs.Parse(rest)
+		requireArg("name", *name)
+		requireArg("runtime", *runtime)
+		requireArg("handler", *handler)
+		requireArg("zip", *zipPath)
+
+		zipData, err := os.ReadFile(*zipPath)
 		if err != nil {
-			return fmt.Errorf("invalid memory_mb: %w", err)
+			fatal("read zip file: %v", err)
 		}
+		b64Zip := base64.StdEncoding.EncodeToString(zipData)
+
+		body := map[string]interface{}{
+			"FunctionName": *name,
+			"Runtime":      *runtime,
+			"Handler":      *handler,
+			"Role":         "arn:aws:iam::123456789012:role/mock-role",
+			"Code": map[string]string{
+				"ZipFile": b64Zip,
+			},
+		}
+		resp, err := makeJSONRequest("POST", "/lambda/2015-03-31/functions", body, nil)
+		if err != nil {
+			fatal("%v", err)
+		}
+		printJSON(resp)
+
+	case "list":
+		resp, err := makeJSONRequest("GET", "/lambda/2015-03-31/functions", nil, nil)
+		if err != nil {
+			fatal("%v", err)
+		}
+		printJSON(resp)
+
+	case "get":
+		fs := flag.NewFlagSet("get", flag.ExitOnError)
+		name := fs.String("name", "", "Function name")
+		fs.Parse(rest)
+		requireArg("name", *name)
+
+		resp, err := makeJSONRequest("GET", "/lambda/2015-03-31/functions/"+*name, nil, nil)
+		if err != nil {
+			fatal("%v", err)
+		}
+		printJSON(resp)
+
+	case "invoke":
+		fs := flag.NewFlagSet("invoke", flag.ExitOnError)
+		name := fs.String("name", "", "Function name")
+		payload := fs.String("payload", "{}", "JSON payload string")
+		fs.Parse(rest)
+		requireArg("name", *name)
+
+		var payloadVal interface{}
+		if err := json.Unmarshal([]byte(*payload), &payloadVal); err != nil {
+			fatal("invalid payload JSON: %v", err)
+		}
+
+		resp, err := makeJSONRequest(
+			"POST",
+			"/lambda/2015-03-31/functions/"+*name+"/invocations",
+			payloadVal,
+			nil,
+		)
+		if err != nil {
+			fatal("%v", err)
+		}
+		printJSON(resp)
+
+	case "delete":
+		fs := flag.NewFlagSet("delete", flag.ExitOnError)
+		name := fs.String("name", "", "Function name")
+		fs.Parse(rest)
+		requireArg("name", *name)
+
+		resp, err := makeJSONRequest("DELETE", "/lambda/2015-03-31/functions/"+*name, nil, nil)
+		if err != nil {
+			fatal("%v", err)
+		}
+		if resp != nil {
+			printJSON(resp)
+		} else {
+			fmt.Printf("Deleted Lambda function: %s\n", *name)
+		}
+
+	default:
+		fmt.Fprintf(os.Stderr, "error: unknown lambda action %q\n\n", action)
+		lambdaPrintUsage()
+		os.Exit(1)
 	}
-
-	reqBody := map[string]interface{}{
-		"Action":       "CreateFunction",
-		"FunctionName": functionName,
-		"Runtime":      runtime,
-		"Handler":      "index.handler",
-		"MemoryMB":     memory,
-		"Timeout":      30,
-	}
-
-	resp, err := makeRequest("POST", "/aws/lambda", reqBody)
-	if err != nil {
-		return err
-	}
-
-	// Print function name for easy capture
-	fmt.Println(resp["FunctionName"])
-	return nil
-}
-
-func lambdaInvoke(functionName, payload string) error {
-	reqBody := map[string]interface{}{
-		"Action":       "Invoke",
-		"FunctionName": functionName,
-		"Payload":      payload,
-	}
-
-	resp, err := makeRequest("POST", "/aws/lambda", reqBody)
-	if err != nil {
-		return err
-	}
-
-	printJSON(resp)
-	return nil
-}
-
-func lambdaDelete(functionName string) error {
-	reqBody := map[string]interface{}{
-		"Action":       "DeleteFunction",
-		"FunctionName": functionName,
-	}
-
-	_, err := makeRequest("POST", "/aws/lambda", reqBody)
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Deleted Lambda function: %s\n", functionName)
-	return nil
-}
-
-func lambdaList() error {
-	reqBody := map[string]interface{}{
-		"Action": "ListFunctions",
-	}
-
-	resp, err := makeRequest("POST", "/aws/lambda", reqBody)
-	if err != nil {
-		return err
-	}
-
-	printJSON(resp)
-	return nil
 }
